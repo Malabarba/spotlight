@@ -365,7 +365,6 @@ variables: `beacon-mode', `beacon-dont-blink-commands',
 `beacon-dont-blink-predicates'."
   ;; Record vars here in case something is blinking outside the
   ;; command loop.
-  (beacon--record-vars)
   (unless (or (not beacon-mode)
               (run-hook-with-args-until-success 'beacon-dont-blink-predicates)
               (seq-find #'derived-mode-p beacon-dont-blink-major-modes)
@@ -403,13 +402,40 @@ The same is true for DELTA-X and horizonta movement."
                (> (max p beacon--previous-place)
                   (line-beginning-position)))))))
 
+(defun beacon-backward-forward-resetp ()
+  (not (or (equal last-command 'beacon-backward-forward-previous-location)
+           (equal last-command 'beacon-backward-forward-next-location))))
+
+(defun beacon-backward-forward-previous-location ()
+  "A `backward-forward-previous-location' wrap for skip invalid locations."
+  (interactive)
+  (when (beacon-backward-forward-resetp)
+    (setq backward-forward-mark-ring-traversal-position 0))
+  (let ((purge (< backward-forward-mark-ring-traversal-position (1- (length backward-forward-mark-ring))))
+        (recent (point-marker)))
+    (backward-forward-previous-location)
+    (when (and (equal recent (point-marker)) purge)
+      (beacon-backward-forward-previous-location))))
+
+(defun beacon-backward-forward-next-location ()
+  "A `backward-forward-next-location' wrap for skip invalid locations."
+  (interactive)
+  (when (beacon-backward-forward-resetp)
+    (setq backward-forward-mark-ring-traversal-position 0))
+  (let ((purge (> backward-forward-mark-ring-traversal-position 0))
+        (recent (point-marker)))
+    (backward-forward-next-location)
+    (when (and (equal recent (point-marker)) purge)
+      (beacon-backward-forward-next-location))))
+
 (defun beacon--maybe-push-mark ()
   "Push mark if it seems to be safe."
   (when (and (not mark-active)
              (beacon--movement-> beacon-push-mark))
     (let ((head (car mark-ring)))
       (when (and (eq beacon--previous-mark-head head)
-                 (not (equal head beacon--previous-place)))
+                 (not (equal head beacon--previous-place))
+                 (beacon-backward-forward-resetp))
         (push-mark beacon--previous-place 'silent)))))
 
 (defun beacon--post-command ()
