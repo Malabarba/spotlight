@@ -1,5 +1,4 @@
 ;;; beacon.el --- Highlight the cursor whenever the window scrolls  -*- lexical-binding: t; -*-
-
 ;; Copyright (C) 2015 Free Software Foundation, Inc.
 
 ;; Author: Artur Malabarba <emacs@endlessparentheses.com>
@@ -37,26 +36,9 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'seq)
 (require 'faces)
-(if (fboundp 'seq-mapn)
-    (defalias 'beacon--seq-mapn #'seq-mapn)
-  ;; This is for people who are on outdated Emacs snapshots. Will be
-  ;; deleted in a couple of weeks.
-  (defun beacon--seq-mapn (function sequence &rest sequences)
-    "Like `seq-map' but FUNCTION is mapped over all SEQUENCES.
-The arity of FUNCTION must match the number of SEQUENCES, and the
-mapping stops on the shortest sequence.
-Return a list of the results.
-
-\(fn FUNCTION SEQUENCES...)"
-    (let ((result nil)
-          (sequences (seq-map (lambda (s) (seq-into s 'list))
-                              (cons sequence sequences))))
-      (while (not (memq nil sequences))
-        (push (apply function (seq-map #'car sequences)) result)
-        (setq sequences (seq-map #'cdr sequences)))
-      (nreverse result))))
 
 (defgroup beacon nil
   "Customization group for beacon."
@@ -64,46 +46,25 @@ Return a list of the results.
   :prefix "beacon-")
 
 (defvar beacon--timer nil)
+(defvar beacon-mark-ring nil)
+(defvar beacon-mark-ring-max 48
+  "Maximum size of overall mark ring.  Start discarding off end if gets this big.")
 
-(defcustom beacon-push-mark 35
+(defvar beacon-mark-ring-traversal-position 0
+  "Stores the traversal location within the beacon-mark-ring.")
+
+(defvar beacon-last-mark-before-jump nil)
+
+(defvar beacon-in-progress nil
+  "Suppresses generation of marks in beacon-ring.
+Dynamically bound to during the navigation process.")
+
+(defcustom beacon-push-mark-p-or-threshold 3
   "Should the mark be pushed before long movements?
 If nil, `beacon' will not push the mark.
 Otherwise this should be a number, and `beacon' will push the
 mark whenever point moves more than that many lines."
   :type '(choice integer (const nil)))
-
-(defcustom beacon-blink-when-point-moves-vertically nil
-  "Should the beacon blink when moving a long distance vertically?
-If nil, don't blink due to vertical movement.
-If non-nil, this should be an integer, which is the minimum
-movement distance (in lines) that triggers a beacon blink."
-  :type '(choice integer (const nil)))
-
-(defcustom beacon-blink-when-point-moves-horizontally nil
-  "Should the beacon blink when moving a long distance horizontally?
-If nil, don't blink due to horizontal movement.
-If non-nil, this should be an integer, which is the minimum
-movement distance (in columns) that triggers a beacon blink."
-  :type '(choice integer (const nil)))
-
-(defcustom beacon-blink-when-buffer-changes t
-  "Should the beacon blink when changing buffer?"
-  :type 'boolean)
-
-(defcustom beacon-blink-when-window-scrolls t
-  "Should the beacon blink when the window scrolls?"
-  :type 'boolean)
-
-(defcustom beacon-blink-when-window-changes t
-  "Should the beacon blink when the window changes?"
-  :type 'boolean)
-
-(defcustom beacon-blink-when-focused nil
-  "Should the beacon blink when Emacs gains focus?
-Note that, due to a limitation of `focus-in-hook', this might
-trigger false positives on some systems."
-  :type 'boolean
-  :package-version '(beacon . "0.2"))
 
 (defcustom beacon-blink-duration 0.3
   "Time, in seconds, that the blink should last."
@@ -157,17 +118,16 @@ For instance, if you want to disable beacon on buffers where
 (add-hook 'beacon-dont-blink-predicates #'beacon--compilation-mode-p)
 
 (defcustom beacon-dont-blink-major-modes '(t magit-status-mode magit-popup-mode
-                                       inf-ruby-mode
-                                       mu4e-headers-mode
-                                       gnus-summary-mode gnus-group-mode)
+                                             inf-ruby-mode
+                                             mu4e-headers-mode
+                                             gnus-summary-mode gnus-group-mode)
   "A list of major-modes where the beacon won't blink.
 Whenever the current buffer satisfies `derived-mode-p' for
 one of the major-modes on this list, the beacon will not
 blink."
   :type '(repeat symbol))
 
-(defcustom beacon-dont-blink-commands '(next-line previous-line
-                                            forward-line)
+(defcustom beacon-dont-blink-commands '(next-line previous-line forward-line)
   "A list of commands that should not make the beacon blink.
 Use this for commands that scroll the window in very
 predictable ways, when the blink would be more distracting
@@ -181,18 +141,18 @@ than helpful.."
 
 ;;; Internal variables
 (defvar beacon--window-scrolled nil)
-(defvar beacon--previous-place nil)
-(defvar beacon--previous-mark-head nil)
-(defvar beacon--previous-window nil)
-(defvar beacon--previous-window-start 0)
+(defvar beacon--pre-command-point-marker nil)
+(defvar beacon--pre-command-mark-ring-head nil)
+(defvar beacon--pre-command-window nil)
+(defvar beacon--pre-command-window-start 0)
 
 (defun beacon--record-vars ()
   "Record some variables for interal use."
   (unless (window-minibuffer-p)
-    (setq beacon--previous-mark-head (car mark-ring))
-    (setq beacon--previous-place (point-marker))
-    (setq beacon--previous-window (selected-window))
-    (setq beacon--previous-window-start (window-start))))
+    (setq beacon--pre-command-mark-ring-head (car mark-ring))
+    (setq beacon--pre-command-point-marker (point-marker))
+    (setq beacon--pre-command-window (selected-window))
+    (setq beacon--pre-command-window-start (window-start))))
 
 
 ;;; Overlays
@@ -264,8 +224,6 @@ COLORS applied to each one."
 (defun beacon--vanish (&rest _)
   "Turn off the beacon."
   (when (get-buffer-window)
-    (when (timerp beacon--timer)
-      (cancel-timer beacon--timer))
     (mapc #'delete-overlay beacon--ovs)
     (setq beacon--ovs nil)))
 
@@ -301,7 +259,7 @@ Only returns `beacon-size' elements."
                (make-list 3 (* beacon-color 65535)))
               (t (make-list 3 (* (- 1 beacon-color) 65535))))))
     (when bg
-      (apply #'beacon--seq-mapn (lambda (r g b) (format "#%04x%04x%04x" r g b))
+      (apply #'seq-mapn (lambda (r g b) (format "#%04x%04x%04x" r g b))
              (mapcar (lambda (n) (butlast (beacon--int-range (elt fg n) (elt bg n))))
                      [0 1 2])))))
 
@@ -342,35 +300,34 @@ Only returns `beacon-size' elements."
 
 ;;;###autoload
 (defun beacon-blink ()
-  "Blink the beacon at the position of the cursor.
-Unlike `beacon-blink-automated', the beacon will blink
+  "Blink the beacon at the location of the cursor.
+Unlike `beacon--blink-automated', the beacon will blink
 unconditionally (even if `beacon-mode' is disabled), and this can
 be invoked as a user command or called from Lisp code."
   (interactive)
-  (beacon--vanish)
   (run-hooks 'beacon-before-blink-hook)
-  (beacon--shine)
   (when (timerp beacon--timer)
     (cancel-timer beacon--timer))
+  (beacon--vanish)
+  (beacon--shine)
   (setq beacon--timer
         (run-at-time beacon-blink-delay
                      (/ beacon-blink-duration 1.0 beacon-size)
                      #'beacon--dec)))
 
-(defun beacon-blink-automated ()
-  "If appropriate, blink the beacon at the position of the cursor.
+(defun beacon--blink-automated (&optional ignore-check)
+  "If appropriate, blink the beacon at the location of the cursor.
 Unlike `beacon-blink', the blinking is conditioned on a series of
 variables: `beacon-mode', `beacon-dont-blink-commands',
 `beacon-dont-blink-major-modes', and
 `beacon-dont-blink-predicates'."
   ;; Record vars here in case something is blinking outside the
   ;; command loop.
-  (beacon--record-vars)
-  (unless (or (not beacon-mode)
-              (run-hook-with-args-until-success 'beacon-dont-blink-predicates)
+  (unless (or (run-hook-with-args-until-success 'beacon-dont-blink-predicates)
               (seq-find #'derived-mode-p beacon-dont-blink-major-modes)
               (memq (or this-command last-command) beacon-dont-blink-commands))
-    (beacon-blink)))
+    (beacon-blink)
+    (beacon--maybe-push-mark ignore-check)))
 
 
 ;;; Movement detection
@@ -379,18 +336,18 @@ variables: `beacon-mode', `beacon-dont-blink-commands',
 If DELTA-Y is nil, return nil.
 The same is true for DELTA-X and horizonta movement."
   (and delta-y
-       (markerp beacon--previous-place)
-       (equal (marker-buffer beacon--previous-place)
+       (markerp beacon--pre-command-point-marker)
+       (equal (marker-buffer beacon--pre-command-point-marker)
               (current-buffer))
        ;; Quick check that prevents running the code below in very
        ;; short movements (like typing).
-       (> (abs (- (point) beacon--previous-place))
+       (> (abs (- (point) beacon--pre-command-point-marker))
           delta-y)
        ;; Col movement.
        (or (and delta-x
                 (> (abs (- (current-column)
                            (save-excursion
-                             (goto-char beacon--previous-place)
+                             (goto-char beacon--pre-command-point-marker)
                              (current-column))))
                    delta-x))
            ;; Check if the movement was >= DELTA lines by moving DELTA
@@ -398,43 +355,156 @@ The same is true for DELTA-X and horizonta movement."
            ;; thousands of lines.
            (save-excursion
              (let ((p (point)))
-               (goto-char (min beacon--previous-place p))
+               (goto-char (min beacon--pre-command-point-marker p))
                (vertical-motion delta-y)
-               (> (max p beacon--previous-place)
+               (> (max p beacon--pre-command-point-marker)
                   (line-beginning-position)))))))
 
-(defun beacon--maybe-push-mark ()
-  "Push mark if it seems to be safe."
-  (when (and (not mark-active)
-             (beacon--movement-> beacon-push-mark))
-    (let ((head (car mark-ring)))
-      (when (and (eq beacon--previous-mark-head head)
-                 (not (equal head beacon--previous-place)))
-        (push-mark beacon--previous-place 'silent)))))
+(defun beacon--scroll-command-p (cmd)
+  (or (equal cmd 'scroll-up-command)
+      (equal cmd 'scroll-down-command)))
+
+(defun beacon-increase-mark-position (&optional step)
+  "Used to navigate to the previous location on beacon-mark-ring.
+1. Increments beacon-mark-ring-traversal-position.
+2. Jumps to the mark at that position.
+Borrows code from `pop-global-mark'."
+  (interactive)
+  (when beacon-mark-ring
+    (cl-incf beacon-mark-ring-traversal-position step)
+    (setq beacon-mark-ring-traversal-position (mod beacon-mark-ring-traversal-position (length beacon-mark-ring)))
+    (beacon--go-to-marker (elt beacon-mark-ring beacon-mark-ring-traversal-position))
+    (message "beacon-mark-position: %s" beacon-mark-ring-traversal-position)))
+
+(defun beacon-push-mark-wrapper (&rest args)
+  "Allows one to bind push-mark to various commands of your choosing.
+Optional argument ARGS completely ignored"
+  (beacon--push-mark (point) 'silent))
+
+(defun beacon--backward-forward-last-command-p ()
+  (or (equal last-command 'beacon-backward-forward-previous)
+      (equal last-command 'beacon-backward-forward-next)))
+
+(defun beacon--backward-forward-this-command-p ()
+  (or (equal this-command 'beacon-backward-forward-previous)
+      (equal this-command 'beacon-backward-forward-next)))
+
+(defun beacon-backward-forward-previous ()
+  "A `beacon-increase-mark-position' wrap for skip invalid locations."
+  (interactive)
+  (when (not (beacon--backward-forward-last-command-p))
+    (setq beacon-mark-ring-traversal-position -1))
+  (beacon-increase-mark-position 1))
+
+(defun beacon-backward-forward-next ()
+  "A `beacon-increase-mark-position' wrap for skip invalid locations."
+  (interactive)
+  (when (not (beacon--backward-forward-last-command-p))
+    (setq beacon-mark-ring-traversal-position 0))
+  (beacon-increase-mark-position -1))
+
+(defun beacon--push-mark (&optional location nomsg activate)
+  "Handles mark-tracking work for backward-forward.
+ignores its arguments LOCATION, NOMSG, ACTIVATE
+Uses following steps:
+pushes the just-created mark by `push-mark' onto beacon-mark-ring
+\(If we exceed beacon-mark-ring-max then old marks are pushed off\)
+
+note that perhaps this should establish one ring per window in the future"
+  (unless beacon-in-progress
+    ;;      (message "beacon--push-mark %S %S %S" location nomsg activate)
+    ;; based on push-mark
+    (let* ((buffer (current-buffer))
+           (marker (set-marker (mark-marker) (or location (point)) buffer))
+           (old (nth beacon-mark-ring-max beacon-mark-ring))
+           (history-delete-duplicates nil))
+      ;;don't insert duplicate marks
+      (if (or (eql (length beacon-mark-ring) 0)
+              (not (and (eql location (marker-position (elt beacon-mark-ring 0)))
+                        (eql buffer (marker-buffer (elt beacon-mark-ring 0))))))
+          (progn
+            ;;                (message "pushing marker %S" marker)
+            (setq beacon-mark-ring (cons (copy-marker marker) beacon-mark-ring))))
+      ;; (add-to-history 'beacon-mark-ring (copy-marker marker) beacon-mark-ring-max t)
+      ;; (when old (set-marker old nil))
+
+      ;;purge excess entries from the end of the list
+      (when (> (length beacon-mark-ring) beacon-mark-ring-max)
+        (move-marker (car (nthcdr beacon-mark-ring-max beacon-mark-ring)) nil)
+        (setcdr (nthcdr (1- beacon-mark-ring-max) beacon-mark-ring) nil)))))
+
+(defun beacon--go-to-marker (marker)
+  "See pop-to-global-mark for where most of this code came from.
+Argument MARKER the marker, in any buffer, to go to."
+  (let* ((buffer (marker-buffer marker))
+         (location (marker-position marker))
+         (beacon-in-progress t))
+    (if (null buffer)
+        (message "buffer no longer exists.")
+      (progn
+        (if (eql buffer (current-buffer))
+            (goto-char marker)
+          (progn
+            (set-buffer buffer)
+            (or (and (>= location (point-min))
+                     (<= location (point-max)))
+                (if widen-automatically
+                    (widen)
+                  (error "Global mark location is outside accessible part of buffer")))
+            (goto-char location)
+            (switch-to-buffer buffer)))))))
+
+;;;###autoload
+(defun beacon--push-mark-with-check (&optional ignore-check)
+  (when (or ignore-check
+            (beacon--movement-> beacon-push-mark-p-or-threshold))
+    (beacon--push-mark beacon--pre-command-point-marker 'silent)))
+
+;;;###autoload
+(defun beacon--maybe-push-mark (&optional ignore-check)
+  "Maybe push pre-command point to beacon-mark-ring."
+  (when (not mark-active)
+    (cond
+     ((beacon--backward-forward-this-command-p)
+      (when (not (beacon--backward-forward-last-command-p))
+        ;; first invocation of beacon-backward-forward, save point-marker, but not in mark ring
+        (setq beacon-last-mark-before-jump beacon--pre-command-point-marker)))
+     ;; run at first and last scroll, the last scroll position is saved
+     ((not (and (beacon--scroll-command-p this-command)
+                (beacon--scroll-command-p last-command)))
+      (beacon--push-mark-with-check ignore-check))
+     ((and (not (beacon--backward-forward-last-command-p))
+           (or
+            ;; mark added to mark-ring
+            (not (eq beacon--pre-command-mark-ring-head (car mark-ring)))
+            ;; no mark added, but command has changed point
+            (not (equal (point-marker) beacon--pre-command-point-marker))))
+      (beacon--push-mark-with-check ignore-check)))))
 
 (defun beacon--post-command ()
   "Blink if point moved very far."
   (cond
    ;; Sanity check.
-   ((not (markerp beacon--previous-place)))
+   ((not (markerp beacon--pre-command-point-marker)))
    ;; Blink for switching buffers.
-   ((and beacon-blink-when-buffer-changes
-         (not (eq (marker-buffer beacon--previous-place)
-                  (current-buffer))))
-    (beacon-blink-automated))
+   ((not (eq (marker-buffer beacon--pre-command-point-marker)
+             (current-buffer)))
+    (beacon--blink-automated))
    ;; Blink for switching windows.
-   ((and beacon-blink-when-window-changes
-         (not (eq beacon--previous-window (selected-window))))
-    (beacon-blink-automated))
+   ((not (eq beacon--pre-command-window (selected-window)))
+    (beacon--blink-automated))
    ;; Blink for scrolling.
    ((and beacon--window-scrolled
          (equal beacon--window-scrolled (selected-window)))
-    (beacon-blink-automated))
+    (beacon--blink-automated))
    ;; Blink for movement
-   ((beacon--movement-> beacon-blink-when-point-moves-vertically
-                  beacon-blink-when-point-moves-horizontally)
-    (beacon-blink-automated)))
-  (beacon--maybe-push-mark)
+   ((beacon--movement-> beacon-push-mark-p-or-threshold)
+    (beacon--blink-automated t)))
+  (when (and (beacon--backward-forward-last-command-p)
+             (equal this-command 'keyboard-quit)
+             beacon-last-mark-before-jump)
+    (beacon--go-to-marker beacon-last-mark-before-jump)
+    (beacon-blink))
   (setq beacon--window-scrolled nil))
 
 (defun beacon--window-scroll-function (window start-pos)
@@ -446,18 +516,11 @@ scrolled window might not be active, but we only know that at
 
 If invoked outside the command loop, `post-command-hook' would be
 unreliable, so just blink immediately."
-  (unless (or (and (equal beacon--previous-window-start start-pos)
-                   (equal beacon--previous-window window))
-              (not beacon-blink-when-window-scrolls))
+  (unless (and (equal beacon--pre-command-window-start start-pos)
+               (equal beacon--pre-command-window window))
     (if this-command
         (setq beacon--window-scrolled window)
-      (setq beacon--window-scrolled nil)
-      (beacon-blink-automated))))
-
-(defun beacon--blink-on-focus ()
-  "Blink if `beacon-blink-when-focused' is non-nil."
-  (when beacon-blink-when-focused
-    (beacon-blink-automated)))
+      (setq beacon--window-scrolled nil))))
 
 
 ;;; Minor-mode
@@ -473,21 +536,31 @@ unreliable, so just blink immediately."
 (define-minor-mode beacon-mode
   nil :lighter beacon-lighter
   :global t
+  :keymap (let ((map (make-sparse-keymap)))
+            (define-key map (kbd "<C-left>") #'beacon-backward-forward-previous)
+            (define-key map (kbd "<C-right>") #'beacon-backward-forward-next)
+            map)
   (if beacon-mode
       (progn
+        ;; (advice-add 'push-mark :after #'beacon--maybe-push-mark)
+        ;; (advice-add 'ggtags-find-tag-dwim :before #'beacon-push-mark-wrapper)
+        ;; (advice-add 'switch-to-buffer :before #'beacon-push-mark-wrapper)
+
         (add-hook 'window-scroll-functions #'beacon--window-scroll-function)
-        (add-function :after after-focus-change-function
-                      #'beacon--blink-on-focus)
+        (add-function :after after-focus-change-function #'beacon--blink-automated)
         (add-hook 'post-command-hook #'beacon--post-command)
         (add-hook 'before-change-functions #'beacon--vanish)
-        (add-hook 'pre-command-hook #'beacon--record-vars)
-        (add-hook 'pre-command-hook #'beacon--vanish))
-    (remove-function after-focus-change-function #'beacon--blink-on-focus)
+        (add-hook 'pre-command-hook #'beacon--record-vars))
+
+    ;; (advice-remove 'push-mark #'beacon--maybe-push-mark)
+    ;; (advice-remove 'ggtags-find-tag-dwim #'push-mark)
+    ;; (advice-remove 'switch-to-buffer #'beacon-push-mark-wrapper)
+
+    (remove-function after-focus-change-function #'beacon--blink-automated)
     (remove-hook 'window-scroll-functions #'beacon--window-scroll-function)
     (remove-hook 'post-command-hook #'beacon--post-command)
     (remove-hook 'before-change-functions #'beacon--vanish)
-    (remove-hook 'pre-command-hook #'beacon--record-vars)
-    (remove-hook 'pre-command-hook #'beacon--vanish)))
+    (remove-hook 'pre-command-hook #'beacon--record-vars)))
 
 (provide 'beacon)
 ;;; beacon.el ends here
